@@ -1,0 +1,147 @@
+name: dbopt
+
+# ---------------------------------------------------------------------------
+# Database Optimizer — local stack
+#
+#   meta      the application's OWN database (connections, snapshots, audit log)
+#   sandbox   a disposable Postgres with a deliberately badly-indexed schema
+#   workload  generates real traffic against sandbox so there is something to find
+#   backend   FastAPI
+#   frontend  Next.js
+#   ollama    optional local LLM  (docker compose --profile ollama up)
+#
+# Nothing here is exposed beyond localhost.
+# ---------------------------------------------------------------------------
+
+services:
+  meta:
+    image: postgres:17-alpine
+    container_name: dbopt-meta
+    environment:
+      POSTGRES_USER: dbopt
+      POSTGRES_PASSWORD: dbopt
+      POSTGRES_DB: dbopt_meta
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbopt -d dbopt_meta"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  sandbox:
+    image: postgres:17-alpine
+    container_name: dbopt-sandbox
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sandbox
+      POSTGRES_DB: shopdb
+    command:
+      - postgres
+      # pg_stat_statements is the backbone of the slow-query view.
+      # auto_explain captures plans for slow statements without us polling for them.
+      - -c
+      - shared_preload_libraries=pg_stat_statements,auto_explain
+      - -c
+      - pg_stat_statements.max=10000
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - pg_stat_statements.track_utility=off
+      - -c
+      - auto_explain.log_min_duration=200ms
+      - -c
+      - auto_explain.log_analyze=on
+      - -c
+      - auto_explain.log_buffers=on
+      - -c
+      - auto_explain.log_format=json
+      - -c
+      - auto_explain.log_nested_statements=on
+      - -c
+      - track_io_timing=on
+      - -c
+      - track_functions=pl
+      # Deliberately small so the sandbox produces cache misses and spills,
+      # which is the whole point of having a sandbox.
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=1MB
+      - -c
+      - max_connections=100
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - sandbox-data:/var/lib/postgresql/data
+      - ./sandbox/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shopdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  workload:
+    build:
+      context: ./sandbox/workload
+    container_name: dbopt-workload
+    environment:
+      SANDBOX_DSN: postgresql://workload:workload@sandbox:5432/shopdb
+      WORKLOAD_CONCURRENCY: "4"
+      WORKLOAD_PAUSE_SECONDS: "0.4"
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: dbopt-backend
+    env_file:
+      - .env
+    environment:
+      DBOPT_META_DSN: postgresql+asyncpg://dbopt:dbopt@meta:5432/dbopt_meta
+      DBOPT_SANDBOX_DSN: postgresql://dbopt_monitor:monitor@sandbox:5432/shopdb
+      DBOPT_SANDBOX_APPLY_DSN: postgresql://dbopt_apply:apply@sandbox:5432/shopdb
+      DBOPT_SANDBOX_AUTO_REGISTER: "true"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      meta:
+        condition: service_healthy
+      sandbox:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: dbopt-frontend
+    environment:
+      # Browser-side calls go to the host-published port, not the compose network.
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dbopt-ollama
+    profiles: ["ollama"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  meta-data:
+  sandbox-data:
+  ollama-data:
